@@ -1,0 +1,28 @@
+name: Import Accuranker CSV
+
+on:
+  workflow_dispatch:
+    inputs:
+      csv_filename:
+        description: 'CSV filnavn (f.eks. AccuRanker_footstoredk_2026-04-24.csv)'
+        required: true
+      domain:
+        description: 'Domæne (f.eks. footstore.dk)'
+        required: true
+
+jobs:
+  import-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install supabase pandas python-dotenv
+      - name: Run import
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python import_accuranker.py --csv "${{ github.event.inputs.csv_filename }}" --domain "${{ github.event.inputs.domain }}"
