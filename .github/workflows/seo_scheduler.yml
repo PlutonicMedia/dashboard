@@ -1,0 +1,50 @@
+name: SEO Data Scheduler
+
+on:
+  schedule:
+    # Kører kl. 04:00 UTC hver mandag, onsdag og fredag
+    - cron: '0 4 * * 1,3,5'
+  workflow_dispatch:
+    # Tillader manuel kørsel fra GitHub Actions UI
+
+jobs:
+  fetch-seo-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run SEO scheduler
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATAFORSEO_LOGIN: ${{ secrets.DATAFORSEO_LOGIN }}
+          DATAFORSEO_PASSWORD: ${{ secrets.DATAFORSEO_PASSWORD }}
+          AHREFS_API_TOKEN: ${{ secrets.AHREFS_API_TOKEN }}
+        run: |
+          python seo_scheduler.py
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "SEO Scheduler fejlede! Tjek logs ovenfor."
+          # Tilføj evt. Slack/email notifikation her
