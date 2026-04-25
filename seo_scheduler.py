@@ -1,5 +1,5 @@
 """
-SEO Portal — Data Scheduler v6
+SEO Portal — Data Scheduler v7
 Plutonic Media ApS
 
 Henter fra:
@@ -12,6 +12,11 @@ GitHub Secrets påkrævet:
   DATAFORSEO_LOGIN
   DATAFORSEO_PASSWORD
   AHREFS_API_TOKEN
+
+Ændringer v6 → v7:
+  - Fix: metrics-history select fjerner ugyldigt felt 'paid_traffic' → erstattet med 'org_cost'
+  - Fix: top-pages select 'top_keyword_best_position' → 'top_keyword_best_pos'
+  - Fix: organic-competitors select 'competitor' → 'domain' + response-parsing rettet
 """
 
 import os
@@ -204,9 +209,11 @@ def fetch_ahrefs_traffic_history(domain: str) -> list[dict]:
     """
     Henter månedlig organisk trafik-historik via Ahrefs Site Explorer.
     Returnerer liste af {month, organic_traffic, organic_keywords, traffic_value}
+
+    FIX v7: Fjernet ugyldigt 'paid_traffic' felt fra select.
+             Erstattet med 'org_cost' (estimeret traffic value i USD).
     """
     try:
-        # Beregn dato-range: 2 år tilbage
         date_to   = date.today().strftime("%Y-%m-%d")
         date_from = (date.today() - relativedelta(years=2)).strftime("%Y-%m-%d")
 
@@ -215,17 +222,19 @@ def fetch_ahrefs_traffic_history(domain: str) -> list[dict]:
                 f"{AHREFS_BASE}/site-explorer/metrics-history",
                 headers=ahrefs_headers(),
                 params={
-                    "target":     domain,
-                    "mode":       "domain",
-                    "date_from":  date_from,
-                    "date_to":    date_to,
+                    "target":           domain,
+                    "mode":             "domain",
+                    "date_from":        date_from,
+                    "date_to":          date_to,
                     "history_grouping": "monthly",
-                    "select":     "date,org_traffic,org_keywords,paid_traffic",
+                    # FIX: 'paid_traffic' er ikke gyldigt her — rettet til 'org_cost'
+                    "select":           "date,org_traffic,org_keywords,org_cost",
                 },
             )
 
         if r.status_code != 200:
             log.warning(f"  Ahrefs traffic history HTTP {r.status_code} for {domain}")
+            log.warning(f"  Response: {r.text[:300]}")
             return []
 
         data = r.json()
@@ -239,10 +248,11 @@ def fetch_ahrefs_traffic_history(domain: str) -> list[dict]:
             # Normaliser til første dag i måneden
             month = raw_date[:7] + "-01"
             result.append({
-                "month":             month,
-                "organic_traffic":   m.get("org_traffic"),
-                "organic_keywords":  m.get("org_keywords"),
-                "traffic_value":     m.get("paid_traffic"),  # Ahrefs kalder det paid_traffic value
+                "month":            month,
+                "organic_traffic":  m.get("org_traffic"),
+                "organic_keywords": m.get("org_keywords"),
+                # FIX: var m.get("paid_traffic") — rettet til org_cost
+                "traffic_value":    m.get("org_cost"),
             })
 
         log.info(f"  Trafik historik: {len(result)} måneder hentet")
@@ -256,7 +266,9 @@ def fetch_ahrefs_traffic_history(domain: str) -> list[dict]:
 def fetch_ahrefs_top_pages(domain: str) -> list[dict]:
     """
     Henter top sider via Ahrefs Site Explorer top-pages endpoint.
-    Returnerer liste af {url, top_keyword, position, traffic, keyword_count}
+    Returnerer liste af {url, top_keyword, position, traffic, keyword_count, search_volume}
+
+    FIX v7: 'top_keyword_best_position' → 'top_keyword_best_pos' (korrekt API-feltnavn)
     """
     try:
         with httpx.Client(timeout=30) as c:
@@ -264,16 +276,18 @@ def fetch_ahrefs_top_pages(domain: str) -> list[dict]:
                 f"{AHREFS_BASE}/site-explorer/top-pages",
                 headers=ahrefs_headers(),
                 params={
-                    "target":  domain,
-                    "mode":    "domain",
-                    "select":  "url,top_keyword,top_keyword_best_position,sum_traffic,keywords_count,top_keyword_volume",
+                    "target":   domain,
+                    "mode":     "domain",
+                    # FIX: 'top_keyword_best_position' er ugyldigt → rettet til 'top_keyword_best_pos'
+                    "select":   "url,top_keyword,top_keyword_best_pos,sum_traffic,keywords_count,top_keyword_volume",
                     "order_by": "sum_traffic:desc",
-                    "limit":   20,
+                    "limit":    20,
                 },
             )
 
         if r.status_code != 200:
             log.warning(f"  Ahrefs top pages HTTP {r.status_code} for {domain}")
+            log.warning(f"  Response: {r.text[:300]}")
             return []
 
         pages = r.json().get("pages", []) or []
@@ -292,7 +306,8 @@ def fetch_ahrefs_top_pages(domain: str) -> list[dict]:
             result.append({
                 "url":           url_path,
                 "top_keyword":   p.get("top_keyword"),
-                "position":      p.get("top_keyword_best_position"),
+                # FIX: var p.get("top_keyword_best_position") → rettet til "top_keyword_best_pos"
+                "position":      p.get("top_keyword_best_pos"),
                 "traffic":       p.get("sum_traffic"),
                 "keyword_count": p.get("keywords_count"),
                 "search_volume": p.get("top_keyword_volume"),
@@ -310,6 +325,9 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
     """
     Henter organiske konkurrenter via Ahrefs.
     Returnerer liste af {domain, domain_rating, organic_traffic, common_keywords, is_self}
+
+    FIX v7: select-felt 'competitor' → 'domain' (korrekt API-feltnavn)
+            response-parsing comp.get("competitor") → comp.get("domain")
     """
     try:
         with httpx.Client(timeout=30) as c:
@@ -319,7 +337,8 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
                 params={
                     "target":   domain,
                     "mode":     "domain",
-                    "select":   "competitor,domain_rating,org_traffic,common_keywords",
+                    # FIX: 'competitor' er ugyldigt som select-felt → rettet til 'domain'
+                    "select":   "domain,domain_rating,org_traffic,common_keywords",
                     "order_by": "org_traffic:desc",
                     "limit":    10,
                 },
@@ -327,15 +346,15 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
 
         if r.status_code != 200:
             log.warning(f"  Ahrefs competitors HTTP {r.status_code} for {domain}")
+            log.warning(f"  Response: {r.text[:300]}")
             return []
 
         competitors = r.json().get("competitors", []) or []
 
-        # Tilføj kundens eget domæne øverst med is_self=True
-        # Hent domænet selv fra ahrefs_overview
         result = []
         for comp in competitors:
-            comp_domain = normalize_domain(comp.get("competitor", ""))
+            # FIX: var comp.get("competitor", "") → rettet til comp.get("domain", "")
+            comp_domain = normalize_domain(comp.get("domain", ""))
             result.append({
                 "domain":          comp_domain,
                 "domain_rating":   comp.get("domain_rating"),
@@ -367,6 +386,7 @@ def fetch_ahrefs_domain_overview(domain: str) -> dict | None:
             )
         if r.status_code != 200:
             log.warning(f"  Ahrefs overview HTTP {r.status_code}")
+            log.warning(f"  Response: {r.text[:300]}")
             return None
         metrics = r.json().get("metrics", {}) or {}
         return {
@@ -399,7 +419,6 @@ def upsert_traffic_history(supabase: Client, project_id: str, rows: list[dict]):
 def upsert_top_pages(supabase: Client, project_id: str, rows: list[dict]):
     if not rows:
         return
-    # Sæt recorded_at til nu og tilføj project_id
     now = datetime.now(timezone.utc).isoformat()
     data = [{"project_id": project_id, "recorded_at": now, **r} for r in rows]
     try:
@@ -491,7 +510,7 @@ def run_dataforseo_for_project(supabase: Client, project: dict, now: str):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 def run():
-    log.info("=== SEO Portal Scheduler v6 starter ===")
+    log.info("=== SEO Portal Scheduler v7 starter ===")
 
     # Test forbindelser
     dfs_ok    = test_dataforseo()
@@ -563,7 +582,7 @@ def run():
         # Lille pause mellem projekter
         time.sleep(1)
 
-    log.info(f"\n=== Scheduler v6 færdig ===")
+    log.info(f"\n=== Scheduler v7 færdig ===")
 
 
 if __name__ == "__main__":
