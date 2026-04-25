@@ -1,5 +1,5 @@
 """
-SEO Portal — Data Scheduler v12
+SEO Portal — Data Scheduler v13
 Plutonic Media ApS
 
 Henter fra:
@@ -13,8 +13,10 @@ GitHub Secrets påkrævet:
   DATAFORSEO_PASSWORD
   AHREFS_API_TOKEN
 
-Ændringer v11 → v12:
-  - Fix: Site Audit issues timeout øget fra 30s → 60s (timeout ved 736 crawlede sider)
+Ændringer v12 → v13:
+  - Fix: domain_rating castes til int() — Ahrefs returnerer float (77.0),
+         men Supabase-kolonnen er integer → "invalid input syntax for type integer: '77.0'"
+         Fix anvendt på både competitors og domain overview for konsistens.
 """
 
 import os
@@ -56,7 +58,17 @@ AHREFS_BASE      = "https://api.ahrefs.com/v3"
 KEYWORD_DELAY    = 0.5
 
 
-# ─── Domæne-normalisering ────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+def to_int(val) -> int | None:
+    """Konverterer float/str til int sikkert — returnerer None hvis None."""
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
 def normalize_domain(raw: str) -> str:
     if not raw:
         return ""
@@ -228,12 +240,13 @@ def fetch_ahrefs_domain_overview(domain: str) -> dict | None:
             return None
         metrics = r.json().get("metrics", {}) or {}
         return {
-            "domain_rating":     metrics.get("domain_rating"),
-            "ahrefs_rank":       metrics.get("ahrefs_rank"),
-            "backlinks":         metrics.get("backlinks"),
-            "referring_domains": metrics.get("referring_domains"),
-            "organic_keywords":  metrics.get("org_keywords"),
-            "organic_traffic":   metrics.get("org_traffic"),
+            # FIX: to_int() sikrer at floats (77.0) ikke fejler mod integer-kolonner
+            "domain_rating":     to_int(metrics.get("domain_rating")),
+            "ahrefs_rank":       to_int(metrics.get("ahrefs_rank")),
+            "backlinks":         to_int(metrics.get("backlinks")),
+            "referring_domains": to_int(metrics.get("referring_domains")),
+            "organic_keywords":  to_int(metrics.get("org_keywords")),
+            "organic_traffic":   to_int(metrics.get("org_traffic")),
         }
     except Exception as e:
         log.error(f"  Ahrefs overview fejl for {domain}: {e}")
@@ -273,9 +286,9 @@ def fetch_ahrefs_traffic_history(domain: str) -> list[dict]:
                 continue
             result.append({
                 "month":            raw_date[:7] + "-01",
-                "organic_traffic":  m.get("org_traffic"),
+                "organic_traffic":  to_int(m.get("org_traffic")),
                 "organic_keywords": None,
-                "traffic_value":    m.get("org_cost"),
+                "traffic_value":    to_int(m.get("org_cost")),
             })
 
         log.info(f"  Trafik historik: {len(result)} måneder hentet")
@@ -321,10 +334,10 @@ def fetch_ahrefs_top_pages(domain: str) -> list[dict]:
             result.append({
                 "url":           url_path,
                 "top_keyword":   p.get("top_keyword"),
-                "position":      p.get("top_keyword_best_position"),
-                "traffic":       p.get("sum_traffic"),
-                "keyword_count": p.get("keywords"),
-                "search_volume": p.get("top_keyword_volume"),
+                "position":      to_int(p.get("top_keyword_best_position")),
+                "traffic":       to_int(p.get("sum_traffic")),
+                "keyword_count": to_int(p.get("keywords")),
+                "search_volume": to_int(p.get("top_keyword_volume")),
             })
 
         log.info(f"  Top sider: {len(result)} hentet")
@@ -364,9 +377,10 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
             comp_domain = normalize_domain(comp.get("competitor_domain", ""))
             result.append({
                 "domain":          comp_domain,
-                "domain_rating":   comp.get("domain_rating"),
-                "organic_traffic": comp.get("traffic"),
-                "common_keywords": comp.get("keywords_common"),
+                # FIX: to_int() — domain_rating kommer som float (77.0) fra API
+                "domain_rating":   to_int(comp.get("domain_rating")),
+                "organic_traffic": to_int(comp.get("traffic")),
+                "common_keywords": to_int(comp.get("keywords_common")),
                 "is_self":         comp_domain == normalize_domain(domain),
             })
 
@@ -380,11 +394,7 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
 
 # ─── Ahrefs Site Audit ───────────────────────────────────────────────────────
 def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
-    """
-    Henter Site Audit overview + errors for et Ahrefs-projekt.
-
-    FIX v12: Site Audit issues timeout øget fra 30s → 60s.
-    """
+    """Henter Site Audit overview + errors for et Ahrefs-projekt."""
     try:
         # 1. Health score + crawl-stats (gratis endpoint)
         with httpx.Client(timeout=30) as c:
@@ -405,13 +415,13 @@ def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
             return None
 
         hs           = healthscores[0]
-        health_score = hs.get("health_score")
-        crawled_urls = hs.get("total")
+        health_score = to_int(hs.get("health_score"))
+        crawled_urls = to_int(hs.get("total"))
         crawl_status = hs.get("status")
 
         log.info(f"  Site Audit: health={health_score}, crawled={crawled_urls}, status={crawl_status}")
 
-        # 2. Issues — kun Errors, FIX: timeout øget til 60s
+        # 2. Issues — kun Errors, timeout 60s
         with httpx.Client(timeout=60) as c:
             r2 = c.get(
                 f"{AHREFS_BASE}/site-audit/issues",
@@ -422,7 +432,6 @@ def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
         if r2.status_code != 200:
             log.warning(f"  Site Audit issues HTTP {r2.status_code}")
             log.warning(f"  Response: {r2.text[:300]}")
-            # Returner overview uden issues fremfor at fejle helt
             return {
                 "health_score": health_score,
                 "crawled_urls": crawled_urls,
@@ -431,12 +440,11 @@ def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
 
         all_issues = r2.json().get("issues", []) or []
 
-        # Filtrer kun Errors med mindst 1 berørt URL
         errors = [
             {
                 "issue_id": issue.get("issue_id"),
                 "name":     issue.get("name"),
-                "crawled":  issue.get("crawled"),
+                "crawled":  to_int(issue.get("crawled")),
             }
             for issue in all_issues
             if issue.get("importance") == "Error" and (issue.get("crawled") or 0) > 0
@@ -574,7 +582,7 @@ def run_dataforseo_for_project(supabase: Client, project: dict, now: str):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 def run():
-    log.info("=== SEO Portal Scheduler v12 starter ===")
+    log.info("=== SEO Portal Scheduler v13 starter ===")
 
     dfs_ok    = test_dataforseo()
     ahrefs_ok = test_ahrefs()
@@ -647,7 +655,7 @@ def run():
 
         time.sleep(1)
 
-    log.info(f"\n=== Scheduler v12 færdig ===")
+    log.info(f"\n=== Scheduler v13 færdig ===")
 
 
 if __name__ == "__main__":
