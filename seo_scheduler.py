@@ -1,5 +1,5 @@
 """
-SEO Portal — Data Scheduler v13
+SEO Portal — Data Scheduler v14
 Plutonic Media ApS
 
 Henter fra:
@@ -13,10 +13,15 @@ GitHub Secrets påkrævet:
   DATAFORSEO_PASSWORD
   AHREFS_API_TOKEN
 
-Ændringer v12 → v13:
-  - Fix: domain_rating castes til int() — Ahrefs returnerer float (77.0),
-         men Supabase-kolonnen er integer → "invalid input syntax for type integer: '77.0'"
-         Fix anvendt på både competitors og domain overview for konsistens.
+Ændringer v13 → v14:
+  - Fix: fetch_ahrefs_domain_overview() bruger nu 3 separate API-kald:
+      1. /site-explorer/metrics         → org_traffic, org_keywords
+      2. /site-explorer/domain-rating   → domain_rating, ahrefs_rank
+      3. /site-explorer/backlinks-stats → backlinks (live), referring_domains (live_refdomains)
+    Årsag: /site-explorer/metrics returnerer KUN trafik-felter. domain_rating,
+    backlinks og referring_domains er ikke tilgængelige på det endpoint — de
+    returneres som None selvom kaldet giver HTTP 200. Dette forklarede hvorfor
+    DR, Backlinks og Ref. Domains altid var NULL i Supabase.
 """
 
 import os
@@ -221,36 +226,100 @@ def test_ahrefs() -> bool:
 
 # ─── Ahrefs Site Explorer ────────────────────────────────────────────────────
 def fetch_ahrefs_domain_overview(domain: str) -> dict | None:
-    """Henter domain overview: DR, backlinks, referring domains, org traffic, org keywords."""
+    """
+    Henter domain overview via 3 separate Ahrefs API-kald:
+
+      1. /site-explorer/metrics       → org_traffic, org_keywords
+      2. /site-explorer/domain-rating → domain_rating, ahrefs_rank
+      3. /site-explorer/backlinks-stats → backlinks (live), referring_domains (live_refdomains)
+
+    Baggrund: /site-explorer/metrics returnerer KUN trafik-felter og giver
+    HTTP 200 selv når domain_rating/backlinks/referring_domains mangler —
+    de returneres simpelthen ikke af det endpoint.
+    """
+    today  = today_str()
+    hdrs   = ahrefs_headers()
+    result = {}
+
+    # ── 1. Trafik + keywords ──────────────────────────────────────────────────
     try:
         with httpx.Client(timeout=30) as c:
             r = c.get(
                 f"{AHREFS_BASE}/site-explorer/metrics",
-                headers=ahrefs_headers(),
+                headers=hdrs,
                 params={
                     "target": domain,
                     "mode":   "domain",
-                    "date":   today_str(),
-                    "select": "domain_rating,ahrefs_rank,backlinks,referring_domains,org_keywords,org_traffic",
+                    "date":   today,
+                    "select": "org_traffic,org_keywords",
                 },
             )
-        if r.status_code != 200:
-            log.warning(f"  Ahrefs overview HTTP {r.status_code}")
-            log.warning(f"  Response: {r.text[:300]}")
-            return None
-        metrics = r.json().get("metrics", {}) or {}
-        return {
-            # FIX: to_int() sikrer at floats (77.0) ikke fejler mod integer-kolonner
-            "domain_rating":     to_int(metrics.get("domain_rating")),
-            "ahrefs_rank":       to_int(metrics.get("ahrefs_rank")),
-            "backlinks":         to_int(metrics.get("backlinks")),
-            "referring_domains": to_int(metrics.get("referring_domains")),
-            "organic_keywords":  to_int(metrics.get("org_keywords")),
-            "organic_traffic":   to_int(metrics.get("org_traffic")),
-        }
+        if r.status_code == 200:
+            metrics = r.json().get("metrics", {}) or {}
+            result["organic_traffic"]  = to_int(metrics.get("org_traffic"))
+            result["organic_keywords"] = to_int(metrics.get("org_keywords"))
+            log.info(f"  metrics: traffic={result['organic_traffic']}, keywords={result['organic_keywords']}")
+        else:
+            log.warning(f"  metrics HTTP {r.status_code}: {r.text[:200]}")
+            result["organic_traffic"]  = None
+            result["organic_keywords"] = None
     except Exception as e:
-        log.error(f"  Ahrefs overview fejl for {domain}: {e}")
-        return None
+        log.error(f"  metrics fejl for {domain}: {e}")
+        result["organic_traffic"]  = None
+        result["organic_keywords"] = None
+
+    # ── 2. Domain Rating + Ahrefs Rank ────────────────────────────────────────
+    try:
+        with httpx.Client(timeout=30) as c:
+            r = c.get(
+                f"{AHREFS_BASE}/site-explorer/domain-rating",
+                headers=hdrs,
+                params={
+                    "target": domain,
+                    "date":   today,
+                },
+            )
+        if r.status_code == 200:
+            dr = r.json().get("domain_rating", {}) or {}
+            result["domain_rating"] = to_int(dr.get("domain_rating"))
+            result["ahrefs_rank"]   = to_int(dr.get("ahrefs_rank"))
+            log.info(f"  domain-rating: DR={result['domain_rating']}, AR={result['ahrefs_rank']}")
+        else:
+            log.warning(f"  domain-rating HTTP {r.status_code}: {r.text[:200]}")
+            result["domain_rating"] = None
+            result["ahrefs_rank"]   = None
+    except Exception as e:
+        log.error(f"  domain-rating fejl for {domain}: {e}")
+        result["domain_rating"] = None
+        result["ahrefs_rank"]   = None
+
+    # ── 3. Backlinks + Referring Domains ──────────────────────────────────────
+    try:
+        with httpx.Client(timeout=30) as c:
+            r = c.get(
+                f"{AHREFS_BASE}/site-explorer/backlinks-stats",
+                headers=hdrs,
+                params={
+                    "target": domain,
+                    "mode":   "domain",
+                    "date":   today,
+                },
+            )
+        if r.status_code == 200:
+            bls = r.json().get("metrics", {}) or {}
+            result["backlinks"]         = to_int(bls.get("live"))
+            result["referring_domains"] = to_int(bls.get("live_refdomains"))
+            log.info(f"  backlinks-stats: backlinks={result['backlinks']}, refdomains={result['referring_domains']}")
+        else:
+            log.warning(f"  backlinks-stats HTTP {r.status_code}: {r.text[:200]}")
+            result["backlinks"]         = None
+            result["referring_domains"] = None
+    except Exception as e:
+        log.error(f"  backlinks-stats fejl for {domain}: {e}")
+        result["backlinks"]         = None
+        result["referring_domains"] = None
+
+    return result if any(v is not None for v in result.values()) else None
 
 
 def fetch_ahrefs_traffic_history(domain: str) -> list[dict]:
@@ -377,7 +446,6 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
             comp_domain = normalize_domain(comp.get("competitor_domain", ""))
             result.append({
                 "domain":          comp_domain,
-                # FIX: to_int() — domain_rating kommer som float (77.0) fra API
                 "domain_rating":   to_int(comp.get("domain_rating")),
                 "organic_traffic": to_int(comp.get("traffic")),
                 "common_keywords": to_int(comp.get("keywords_common")),
@@ -396,7 +464,7 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
 def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
     """Henter Site Audit overview + errors for et Ahrefs-projekt."""
     try:
-        # 1. Health score + crawl-stats (gratis endpoint)
+        # 1. Health score + crawl-stats
         with httpx.Client(timeout=30) as c:
             r = c.get(
                 f"{AHREFS_BASE}/site-audit/projects",
@@ -471,7 +539,9 @@ def upsert_ahrefs_overview(supabase: Client, project_id: str, overview: dict):
             {"project_id": project_id, "updated_at": now, **overview},
             on_conflict="project_id"
         ).execute()
-        log.info(f"  ✓ Domain overview gemt (DR: {overview.get('domain_rating')})")
+        log.info(f"  ✓ Domain overview gemt (DR: {overview.get('domain_rating')}, "
+                 f"Backlinks: {overview.get('backlinks')}, "
+                 f"Ref.domains: {overview.get('referring_domains')})")
     except Exception as e:
         log.error(f"  Fejl ved gem af ahrefs overview: {e}")
 
@@ -582,7 +652,7 @@ def run_dataforseo_for_project(supabase: Client, project: dict, now: str):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 def run():
-    log.info("=== SEO Portal Scheduler v13 starter ===")
+    log.info("=== SEO Portal Scheduler v14 starter ===")
 
     dfs_ok    = test_dataforseo()
     ahrefs_ok = test_ahrefs()
@@ -655,7 +725,7 @@ def run():
 
         time.sleep(1)
 
-    log.info(f"\n=== Scheduler v13 færdig ===")
+    log.info(f"\n=== Scheduler v14 færdig ===")
 
 
 if __name__ == "__main__":
