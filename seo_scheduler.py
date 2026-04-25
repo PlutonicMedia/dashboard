@@ -1,5 +1,5 @@
 """
-SEO Portal — Data Scheduler v11
+SEO Portal — Data Scheduler v12
 Plutonic Media ApS
 
 Henter fra:
@@ -13,23 +13,14 @@ GitHub Secrets påkrævet:
   DATAFORSEO_PASSWORD
   AHREFS_API_TOKEN
 
-Ændringer v10 → v11:
-  - Fix: organic-competitors feltnavne rettet til korrekte API-navne:
-         'domain' → 'competitor_domain'
-         'org_traffic' → 'traffic'
-         'common_keywords' → 'keywords_common'
-         order_by: 'org_traffic' → 'traffic'
-  - Fix: organic-competitors response-parsing rettet tilsvarende
-  - Nyt: Site Audit integration — henter health score + errors fra Ahrefs Site Audit API
-         Gemmer i site_audit_snapshots (project_id, health_score, crawled_urls, issues JSON)
-         Springer over hvis projekt ikke har ahrefs_site_audit_id sat
+Ændringer v11 → v12:
+  - Fix: Site Audit issues timeout øget fra 30s → 60s (timeout ved 736 crawlede sider)
 """
 
 import os
 import sys
 import re
 import time
-import json
 import logging
 import base64
 from datetime import datetime, timezone, date
@@ -296,11 +287,7 @@ def fetch_ahrefs_traffic_history(domain: str) -> list[dict]:
 
 
 def fetch_ahrefs_top_pages(domain: str) -> list[dict]:
-    """
-    Henter top 20 sider sorteret efter trafik.
-    Bekræftede felter: url, top_keyword, top_keyword_best_position,
-                       sum_traffic, keywords, top_keyword_volume
-    """
+    """Henter top 20 sider sorteret efter trafik."""
     try:
         with httpx.Client(timeout=30) as c:
             r = c.get(
@@ -349,15 +336,7 @@ def fetch_ahrefs_top_pages(domain: str) -> list[dict]:
 
 
 def fetch_ahrefs_competitors(domain: str) -> list[dict]:
-    """
-    Henter organiske konkurrenter (top 10 efter trafik).
-
-    FIX v11: Korrekte feltnavne bekræftet fra API-fejlbesked:
-      'domain'         → 'competitor_domain'
-      'org_traffic'    → 'traffic'
-      'common_keywords'→ 'keywords_common'
-      order_by field   → 'traffic'
-    """
+    """Henter organiske konkurrenter (top 10 efter trafik)."""
     try:
         with httpx.Client(timeout=30) as c:
             r = c.get(
@@ -368,7 +347,6 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
                     "mode":     "domain",
                     "date":     today_str(),
                     "country":  "dk",
-                    # FIX: alle feltnavne rettet til hvad API'et rent faktisk hedder
                     "select":   "competitor_domain,domain_rating,traffic,keywords_common",
                     "order_by": "traffic:desc",
                     "limit":    10,
@@ -383,13 +361,12 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
         competitors = r.json().get("competitors", []) or []
         result = []
         for comp in competitors:
-            # FIX: var comp.get("domain") → rettet til comp.get("competitor_domain")
             comp_domain = normalize_domain(comp.get("competitor_domain", ""))
             result.append({
                 "domain":          comp_domain,
                 "domain_rating":   comp.get("domain_rating"),
-                "organic_traffic": comp.get("traffic"),         # FIX: var "org_traffic"
-                "common_keywords": comp.get("keywords_common"), # FIX: var "common_keywords"
+                "organic_traffic": comp.get("traffic"),
+                "common_keywords": comp.get("keywords_common"),
                 "is_self":         comp_domain == normalize_domain(domain),
             })
 
@@ -404,21 +381,12 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
 # ─── Ahrefs Site Audit ───────────────────────────────────────────────────────
 def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
     """
-    Henter Site Audit overview for et Ahrefs-projekt.
+    Henter Site Audit overview + errors for et Ahrefs-projekt.
 
-    Returnerer:
-      {
-        health_score: int,
-        crawled_urls: int,
-        issues: [{ issue_id, name, crawled }, ...]  ← kun Errors
-      }
-
-    Kræver at projektet har et gyldigt ahrefs_site_audit_id.
-    API-endpoint: GET /v3/site-audit/projects (gratis — forbruger ingen API units)
-    API-endpoint: GET /v3/site-audit/issues   (kræver project_id)
+    FIX v12: Site Audit issues timeout øget fra 30s → 60s.
     """
     try:
-        # 1. Hent health score + crawl-stats
+        # 1. Health score + crawl-stats (gratis endpoint)
         with httpx.Client(timeout=30) as c:
             r = c.get(
                 f"{AHREFS_BASE}/site-audit/projects",
@@ -436,15 +404,15 @@ def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
             log.warning(f"  Site Audit: ingen data for project_id {audit_project_id}")
             return None
 
-        hs = healthscores[0]
-        health_score  = hs.get("health_score")
-        crawled_urls  = hs.get("total")
-        crawl_status  = hs.get("status")
+        hs           = healthscores[0]
+        health_score = hs.get("health_score")
+        crawled_urls = hs.get("total")
+        crawl_status = hs.get("status")
 
         log.info(f"  Site Audit: health={health_score}, crawled={crawled_urls}, status={crawl_status}")
 
-        # 2. Hent issues — kun Errors
-        with httpx.Client(timeout=30) as c:
+        # 2. Issues — kun Errors, FIX: timeout øget til 60s
+        with httpx.Client(timeout=60) as c:
             r2 = c.get(
                 f"{AHREFS_BASE}/site-audit/issues",
                 headers=ahrefs_headers(),
@@ -454,7 +422,7 @@ def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
         if r2.status_code != 200:
             log.warning(f"  Site Audit issues HTTP {r2.status_code}")
             log.warning(f"  Response: {r2.text[:300]}")
-            # Returner overview uden issues
+            # Returner overview uden issues fremfor at fejle helt
             return {
                 "health_score": health_score,
                 "crawled_urls": crawled_urls,
@@ -463,7 +431,7 @@ def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
 
         all_issues = r2.json().get("issues", []) or []
 
-        # Filtrer kun Errors (ikke Warnings eller Notices)
+        # Filtrer kun Errors med mindst 1 berørt URL
         errors = [
             {
                 "issue_id": issue.get("issue_id"),
@@ -473,8 +441,6 @@ def fetch_ahrefs_site_audit(audit_project_id: int) -> dict | None:
             for issue in all_issues
             if issue.get("importance") == "Error" and (issue.get("crawled") or 0) > 0
         ]
-
-        # Sorter efter antal berørte URLs
         errors.sort(key=lambda x: x.get("crawled") or 0, reverse=True)
 
         log.info(f"  Site Audit: {len(errors)} errors fundet")
@@ -544,16 +510,13 @@ def upsert_competitors(supabase: Client, project_id: str, rows: list[dict]):
 
 
 def insert_site_audit_snapshot(supabase: Client, project_id: str, audit: dict):
-    """
-    Gemmer Site Audit snapshot i site_audit_snapshots.
-    Indsætter altid en ny række (historik) fremfor upsert.
-    """
+    """Gemmer Site Audit snapshot — indsætter altid ny række (historik)."""
     try:
         supabase.table("site_audit_snapshots").insert({
             "project_id":   project_id,
             "health_score": audit["health_score"],
             "crawled_urls": audit["crawled_urls"],
-            "issues":       audit["issues"],  # JSONB
+            "issues":       audit["issues"],
         }).execute()
         log.info(f"  ✓ Site Audit snapshot gemt (health: {audit['health_score']}, errors: {len(audit['issues'])})")
     except Exception as e:
@@ -611,7 +574,7 @@ def run_dataforseo_for_project(supabase: Client, project: dict, now: str):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 def run():
-    log.info("=== SEO Portal Scheduler v11 starter ===")
+    log.info("=== SEO Portal Scheduler v12 starter ===")
 
     dfs_ok    = test_dataforseo()
     ahrefs_ok = test_ahrefs()
@@ -640,47 +603,40 @@ def run():
     log.info(f"Fundet {len(projects)} projekter")
 
     for project in projects:
-        pid             = project["id"]
-        domain          = project["domain"]
-        audit_proj_id   = project.get("ahrefs_site_audit_id")
+        pid           = project["id"]
+        domain        = project["domain"]
+        audit_proj_id = project.get("ahrefs_site_audit_id")
 
         log.info(f"\n{'='*50}")
         log.info(f"▶ {domain}")
 
-        # ── DataForSEO: Rankings ────────────────────────────
         log.info("  → DataForSEO rankings...")
         run_dataforseo_for_project(supabase, project, now)
 
-        # ── Ahrefs ─────────────────────────────────────────
         if not ahrefs_ok:
             log.info("  → Ahrefs springer over (ikke forbundet)")
             continue
 
-        # Domain overview
         log.info("  → Ahrefs domain overview...")
         overview = fetch_ahrefs_domain_overview(domain)
         if overview:
             upsert_ahrefs_overview(supabase, pid, overview)
 
-        # Trafik historik
         log.info("  → Ahrefs trafik historik...")
         traffic = fetch_ahrefs_traffic_history(domain)
         if traffic:
             upsert_traffic_history(supabase, pid, traffic)
 
-        # Top sider
         log.info("  → Ahrefs top sider...")
         top_pages = fetch_ahrefs_top_pages(domain)
         if top_pages:
             upsert_top_pages(supabase, pid, top_pages)
 
-        # Konkurrenter
         log.info("  → Ahrefs konkurrenter...")
         competitors = fetch_ahrefs_competitors(domain)
         if competitors:
             upsert_competitors(supabase, pid, competitors)
 
-        # Site Audit — kun hvis ahrefs_site_audit_id er sat
         if audit_proj_id:
             log.info(f"  → Ahrefs Site Audit (project {audit_proj_id})...")
             audit = fetch_ahrefs_site_audit(audit_proj_id)
@@ -691,7 +647,7 @@ def run():
 
         time.sleep(1)
 
-    log.info(f"\n=== Scheduler v11 færdig ===")
+    log.info(f"\n=== Scheduler v12 færdig ===")
 
 
 if __name__ == "__main__":
