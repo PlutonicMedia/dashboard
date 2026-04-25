@@ -1,5 +1,5 @@
 """
-SEO Portal — Data Scheduler v9
+SEO Portal — Data Scheduler v10
 Plutonic Media ApS
 
 Henter fra:
@@ -13,10 +13,9 @@ GitHub Secrets påkrævet:
   DATAFORSEO_PASSWORD
   AHREFS_API_TOKEN
 
-Ændringer v8 → v9:
-  - Fix: top-pages 'top_keyword_best_pos' → 'top_keyword_best_position' (korrekt feltnavn)
-  - Fix: organic-competitors manglede obligatorisk 'country' parameter → sat til 'all'
-  - Fix: ahrefs_overview 'updated_at' kolonne løst via Supabase SQL migration (ikke i koden)
+Ændringer v9 → v10:
+  - Fix: top-pages 'keywords_count' → 'keywords' (korrekt feltnavn fra API)
+  - Fix: organic-competitors 'country: all' → 'country: dk' ('all' er ikke gyldig enum)
 """
 
 import os
@@ -186,7 +185,6 @@ def ahrefs_headers() -> dict:
 
 
 def today_str() -> str:
-    """Returnerer dags dato som YYYY-MM-DD."""
     return date.today().strftime("%Y-%m-%d")
 
 
@@ -212,9 +210,7 @@ def test_ahrefs() -> bool:
 
 # ─── Ahrefs API-kald ──────────────────────────────────────────────────────────
 def fetch_ahrefs_domain_overview(domain: str) -> dict | None:
-    """
-    Henter domain overview: DR, backlinks, referring domains, org traffic, org keywords.
-    """
+    """Henter domain overview: DR, backlinks, referring domains, org traffic, org keywords."""
     try:
         with httpx.Client(timeout=30) as c:
             r = c.get(
@@ -248,8 +244,7 @@ def fetch_ahrefs_domain_overview(domain: str) -> dict | None:
 def fetch_ahrefs_traffic_history(domain: str) -> list[dict]:
     """
     Henter månedlig organisk trafik-historik (2 år tilbage).
-    Tilgængelige felter i metrics-history: date, org_traffic, org_cost, paid_cost, paid_traffic
-    org_keywords findes IKKE i dette endpoint.
+    Tilgængelige felter: date, org_traffic, org_cost, paid_cost, paid_traffic
     """
     try:
         date_to   = today_str()
@@ -299,8 +294,8 @@ def fetch_ahrefs_top_pages(domain: str) -> list[dict]:
     """
     Henter top 20 sider sorteret efter trafik.
 
-    FIX v9: 'top_keyword_best_pos' → 'top_keyword_best_position' (korrekt feltnavn
-            bekræftet fra API-fejlbesked: "Available columns: ... top_keyword_best_position ...")
+    FIX v10: 'keywords_count' → 'keywords'
+             (bekræftet fra API-fejlbesked: "Available columns: ... keywords ...")
     """
     try:
         with httpx.Client(timeout=30) as c:
@@ -311,8 +306,8 @@ def fetch_ahrefs_top_pages(domain: str) -> list[dict]:
                     "target":   domain,
                     "mode":     "domain",
                     "date":     today_str(),
-                    # FIX: 'top_keyword_best_pos' → 'top_keyword_best_position'
-                    "select":   "url,top_keyword,top_keyword_best_position,sum_traffic,keywords_count,top_keyword_volume",
+                    # FIX: 'keywords_count' → 'keywords'
+                    "select":   "url,top_keyword,top_keyword_best_position,sum_traffic,keywords,top_keyword_volume",
                     "order_by": "sum_traffic:desc",
                     "limit":    20,
                 },
@@ -336,10 +331,10 @@ def fetch_ahrefs_top_pages(domain: str) -> list[dict]:
             result.append({
                 "url":           url_path,
                 "top_keyword":   p.get("top_keyword"),
-                # FIX: var 'top_keyword_best_pos' → rettet til 'top_keyword_best_position'
                 "position":      p.get("top_keyword_best_position"),
                 "traffic":       p.get("sum_traffic"),
-                "keyword_count": p.get("keywords_count"),
+                # FIX: var 'keywords_count' → rettet til 'keywords'
+                "keyword_count": p.get("keywords"),
                 "search_volume": p.get("top_keyword_volume"),
             })
 
@@ -355,8 +350,8 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
     """
     Henter organiske konkurrenter (top 10 efter trafik).
 
-    FIX v9: Tilføjet obligatorisk 'country' parameter → sat til 'all'
-            (fejlbesked: "missing argument 'country'")
+    FIX v10: 'country: all' → 'country: dk'
+             ('all' er ikke en gyldig enum-værdi — fejl: "bad value all for type enum")
     """
     try:
         with httpx.Client(timeout=30) as c:
@@ -367,7 +362,8 @@ def fetch_ahrefs_competitors(domain: str) -> list[dict]:
                     "target":   domain,
                     "mode":     "domain",
                     "date":     today_str(),
-                    "country":  "all",   # FIX: obligatorisk parameter
+                    # FIX: 'all' er ikke gyldig → rettet til 'dk' (danske domæner)
+                    "country":  "dk",
                     "select":   "domain,domain_rating,org_traffic,common_keywords",
                     "order_by": "org_traffic:desc",
                     "limit":    10,
@@ -504,7 +500,7 @@ def run_dataforseo_for_project(supabase: Client, project: dict, now: str):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 def run():
-    log.info("=== SEO Portal Scheduler v9 starter ===")
+    log.info("=== SEO Portal Scheduler v10 starter ===")
 
     dfs_ok    = test_dataforseo()
     ahrefs_ok = test_ahrefs()
@@ -567,7 +563,7 @@ def run():
 
         time.sleep(1)
 
-    log.info(f"\n=== Scheduler v9 færdig ===")
+    log.info(f"\n=== Scheduler v10 færdig ===")
 
 
 if __name__ == "__main__":
