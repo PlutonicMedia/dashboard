@@ -1,0 +1,397 @@
+"""
+AIO Query Setup — v1
+Plutonic Media ApS
+
+Læser GSC-data fra Supabase for én kunde og foreslår
+de bedste queries til AI Overview tracking.
+
+Indsætter queries i aio_queries med status 'pending'.
+Konsulenten godkender dem efterfølgende.
+
+Brug:
+  py aio_setup_queries.py                        # viser liste over kunder
+  py aio_setup_queries.py --client "kundenavn"   # kør for specifik kunde
+  py aio_setup_queries.py --client-id "uuid"     # kør med client_id direkte
+
+Miljøvariabler påkrævet:
+  SUPABASE_URL
+  SUPABASE_SERVICE_KEY
+"""
+
+import os
+import sys
+import argparse
+import logging
+from collections import defaultdict
+
+from supabase import create_client, Client
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+def get_env(key: str) -> str:
+    val = os.environ.get(key, "")
+    if not val:
+        log.error(f"MANGLER miljøvariabel: {key}")
+        sys.exit(1)
+    return val
+
+SUPABASE_URL         = get_env("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = get_env("SUPABASE_SERVICE_KEY")
+
+MAX_QUERIES_PER_CLIENT = 50   # maks queries per kunde
+TOP_QUERIES_PER_PAGE   = 3    # top N queries per GSC-side
+MIN_CLICKS             = 10   # minimum klik for at en side medtages
+
+
+# ─── Supabase ────────────────────────────────────────────────────────────────
+def get_supabase() -> Client:
+    try:
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        log.info("✓ Supabase forbundet")
+        return client
+    except Exception as e:
+        log.error(f"Supabase fejl: {e}")
+        sys.exit(1)
+
+
+# ─── Kunder ──────────────────────────────────────────────────────────────────
+def list_clients(supabase: Client):
+    """Viser alle kunder med deres project_id."""
+    try:
+        clients = (
+            supabase.table("clients")
+            .select("id, name, domain")
+            .order("name")
+            .execute()
+            .data or []
+        )
+        if not clients:
+            log.info("Ingen kunder fundet i databasen")
+            return
+
+        print("\n=== Kunder i Supabase ===")
+        print(f"{'Navn':<30} {'Domæne':<30} {'ID'}")
+        print("-" * 90)
+        for c in clients:
+            print(f"{c['name']:<30} {c.get('domain',''):<30} {c['id']}")
+        print()
+    except Exception as e:
+        log.error(f"Kan ikke hente kunder: {e}")
+
+
+def find_client(supabase: Client, name: str = None, client_id: str = None) -> dict | None:
+    """Finder én kunde efter navn eller ID."""
+    try:
+        if client_id:
+            result = (
+                supabase.table("clients")
+                .select("id, name, domain")
+                .eq("id", client_id)
+                .single()
+                .execute()
+            )
+        else:
+            result = (
+                supabase.table("clients")
+                .select("id, name, domain")
+                .ilike("name", f"%{name}%")
+                .limit(1)
+                .execute()
+            )
+            if result.data:
+                result.data = result.data[0]
+            else:
+                return None
+
+        return result.data
+    except Exception as e:
+        log.error(f"Kan ikke finde kunde: {e}")
+        return None
+
+
+def get_project_for_client(supabase: Client, client_id: str) -> dict | None:
+    """Finder projekt for en kunde."""
+    try:
+        result = (
+            supabase.table("projects")
+            .select("id, domain, client_id")
+            .eq("client_id", client_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as e:
+        log.error(f"Kan ikke finde projekt: {e}")
+        return None
+
+
+# ─── GSC data ────────────────────────────────────────────────────────────────
+def get_gsc_queries(supabase: Client, project_id: str) -> list[dict]:
+    """
+    Henter GSC query-rækker for et projekt.
+    Bruger page_type='query' — disse er aggregerede søgetermer.
+    """
+    try:
+        rows = (
+            supabase.table("gsc_data")
+            .select("label, clicks, impressions, ctr, position")
+            .eq("project_id", project_id)
+            .eq("page_type", "query")
+            .order("clicks", desc=True)
+            .execute()
+            .data or []
+        )
+        log.info(f"  GSC queries fundet: {len(rows)}")
+        return rows
+    except Exception as e:
+        log.error(f"  Kan ikke hente GSC queries: {e}")
+        return []
+
+
+def get_gsc_pages(supabase: Client, project_id: str) -> list[dict]:
+    """
+    Henter GSC page-rækker for et projekt.
+    Bruges til at kortlægge hvilke sider der har trafik.
+    """
+    try:
+        rows = (
+            supabase.table("gsc_data")
+            .select("label, clicks, impressions, ctr, position")
+            .eq("project_id", project_id)
+            .eq("page_type", "page")
+            .gte("clicks", MIN_CLICKS)
+            .order("clicks", desc=True)
+            .execute()
+            .data or []
+        )
+        log.info(f"  GSC sider med {MIN_CLICKS}+ klik: {len(rows)}")
+        return rows
+    except Exception as e:
+        log.error(f"  Kan ikke hente GSC sider: {e}")
+        return []
+
+
+def select_best_queries(queries: list[dict], pages: list[dict]) -> list[dict]:
+    """
+    Udvælger de bedste queries til AIO-tracking.
+
+    Strategi:
+    1. Sorter sider efter klik (vigtigste sider først)
+    2. Tag top N queries per side baseret på klik
+    3. Cap på MAX_QUERIES_PER_CLIENT i alt
+    4. Fjern dubletter
+
+    Bemærk: GSC giver ikke en direkte kobling mellem
+    sider og queries i aggregeret form. Vi bruger derfor
+    queries sorteret efter klik direkte — de vigtigste
+    søgetermer for domænet samlet set.
+    """
+    if not queries:
+        return []
+
+    seen = set()
+    selected = []
+
+    # Filtrer queries med nok klik og undgå branded/navigations-søgninger
+    skip_patterns = [
+        "login", "log ind", "kontakt", "contact",
+        "om os", "about us", "karriere", "jobs",
+    ]
+
+    for q in queries:
+        label = (q.get("label") or "").strip().lower()
+        if not label:
+            continue
+
+        # Spring navigations-søgninger over
+        if any(p in label for p in skip_patterns):
+            continue
+
+        # Undgå dubletter
+        if label in seen:
+            continue
+
+        # Kræv minimum klik
+        clicks = q.get("clicks") or 0
+        if clicks < MIN_CLICKS:
+            continue
+
+        seen.add(label)
+        selected.append({
+            "query_text": label,
+            "clicks":     clicks,
+            "position":   q.get("position"),
+        })
+
+        if len(selected) >= MAX_QUERIES_PER_CLIENT:
+            break
+
+    log.info(f"  Udvalgte queries: {len(selected)} (maks {MAX_QUERIES_PER_CLIENT})")
+    return selected
+
+
+# ─── Gem queries ─────────────────────────────────────────────────────────────
+def get_existing_queries(supabase: Client, project_id: str) -> set:
+    """Henter queries der allerede er i aio_queries for dette projekt."""
+    try:
+        rows = (
+            supabase.table("aio_queries")
+            .select("query_text")
+            .eq("project_id", project_id)
+            .execute()
+            .data or []
+        )
+        return {r["query_text"].lower() for r in rows}
+    except Exception as e:
+        log.warning(f"  Kan ikke tjekke eksisterende queries: {e}")
+        return set()
+
+
+def insert_pending_queries(
+    supabase: Client,
+    project_id: str,
+    queries: list[dict],
+    approved_by: str = "auto-gsc",
+) -> int:
+    """
+    Indsætter nye queries med status 'pending'.
+    Springer over queries der allerede findes.
+    Returnerer antal indsatte.
+    """
+    existing = get_existing_queries(supabase, project_id)
+    new_queries = [
+        q for q in queries
+        if q["query_text"].lower() not in existing
+    ]
+
+    if not new_queries:
+        log.info("  Ingen nye queries at indsætte — alle findes allerede")
+        return 0
+
+    rows = [
+        {
+            "project_id":      project_id,
+            "query_text":      q["query_text"],
+            "source_gsc_page": f"klik:{q['clicks']}",
+            "status":          "pending",
+            "approved_by":     approved_by,
+        }
+        for q in new_queries
+    ]
+
+    try:
+        supabase.table("aio_queries").insert(rows).execute()
+        log.info(f"  ✓ {len(rows)} queries indsat med status 'pending'")
+        return len(rows)
+    except Exception as e:
+        log.error(f"  Fejl ved indsættelse: {e}")
+        return 0
+
+
+def approve_all_pending(supabase: Client, project_id: str) -> int:
+    """Sætter alle pending queries til active for et projekt."""
+    try:
+        result = (
+            supabase.table("aio_queries")
+            .update({"status": "active"})
+            .eq("project_id", project_id)
+            .eq("status", "pending")
+            .execute()
+        )
+        count = len(result.data or [])
+        log.info(f"  ✓ {count} queries godkendt (sat til 'active')")
+        return count
+    except Exception as e:
+        log.error(f"  Fejl ved godkendelse: {e}")
+        return 0
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+def run():
+    parser = argparse.ArgumentParser(description="AIO Query Setup — Plutonic Media")
+    parser.add_argument("--client",    type=str, help="Kundenavn (delvist match)")
+    parser.add_argument("--client-id", type=str, help="Kunde UUID direkte")
+    parser.add_argument("--approve",   action="store_true",
+                        help="Godkend alle pending queries automatisk (sæt til active)")
+    parser.add_argument("--list",      action="store_true",
+                        help="Vis alle kunder og afslut")
+    args = parser.parse_args()
+
+    supabase = get_supabase()
+
+    # Vis kundeliste
+    if args.list or (not args.client and not args.client_id):
+        list_clients(supabase)
+        print("Brug: py aio_setup_queries.py --client \"kundenavn\"")
+        print("      py aio_setup_queries.py --client \"kundenavn\" --approve")
+        sys.exit(0)
+
+    # Find kunde
+    client = find_client(supabase, name=args.client, client_id=args.client_id)
+    if not client:
+        log.error(f"Kunde ikke fundet: {args.client or args.client_id}")
+        sys.exit(1)
+
+    log.info(f"\n=== AIO Query Setup: {client['name']} ===")
+
+    # Find projekt
+    project = get_project_for_client(supabase, client["id"])
+    if not project:
+        log.error(f"Intet projekt fundet for kunde: {client['name']}")
+        sys.exit(1)
+
+    project_id = project["id"]
+    log.info(f"  Projekt: {project['domain']} ({project_id})")
+
+    # Hent GSC data
+    log.info("  Henter GSC queries...")
+    queries = get_gsc_queries(supabase, project_id)
+
+    log.info("  Henter GSC sider...")
+    pages = get_gsc_pages(supabase, project_id)
+
+    if not queries:
+        log.warning("  Ingen GSC query-data fundet for denne kunde")
+        log.warning("  Tjek at GSC data er importeret i Supabase (gsc_data tabellen)")
+        sys.exit(1)
+
+    # Udvælg bedste queries
+    log.info("  Udvælger bedste queries...")
+    selected = select_best_queries(queries, pages)
+
+    if not selected:
+        log.warning("  Ingen egnede queries fundet efter filtrering")
+        sys.exit(1)
+
+    # Vis forslag
+    print(f"\n=== Foreslåede queries for {client['name']} ===")
+    print(f"{'#':<4} {'Query':<45} {'Klik':<8} {'Position'}")
+    print("-" * 70)
+    for i, q in enumerate(selected, 1):
+        pos = f"{q['position']:.1f}" if q.get("position") else "—"
+        print(f"{i:<4} {q['query_text']:<45} {q['clicks']:<8} {pos}")
+    print(f"\nTotal: {len(selected)} queries")
+
+    # Indsæt i Supabase
+    inserted = insert_pending_queries(supabase, project_id, selected)
+
+    if inserted > 0 and args.approve:
+        log.info("  --approve flag sat: godkender alle pending queries...")
+        approve_all_pending(supabase, project_id)
+    elif inserted > 0:
+        print(f"\n✓ {inserted} queries indsat med status 'pending'")
+        print("  Kør med --approve for at aktivere dem direkte:")
+        print(f"  py aio_setup_queries.py --client \"{client['name']}\" --approve")
+        print("  Eller godkend manuelt i Supabase:")
+        print("  UPDATE aio_queries SET status='active' WHERE project_id='...' AND status='pending';")
+
+
+if __name__ == "__main__":
+    run()
